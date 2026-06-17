@@ -1,10 +1,12 @@
 import { useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import axios from "axios";
 
 const API = "http://127.0.0.1:5000";
 
 export default function SavedNotes() {
   const token = localStorage.getItem("kt_token");
+  const navigate = useNavigate();
   const [notes, setNotes] = useState([]);
   const [loading, setLoading] = useState(true);
 
@@ -143,13 +145,33 @@ export default function SavedNotes() {
           font-family: 'DM Mono', monospace;
           font-size: 0.73rem;
           letter-spacing: 0.04em;
-          line-height: 1.6;
+          line-height: 1.8;
         }
-        .sn-empty a {
+        .sn-link {
           color: var(--nude, #C8A882);
-          text-decoration: none;
-          opacity: 0.7;
+          text-decoration: underline;
+          cursor: none;
+          background: none;
+          border: none;
+          font-family: 'DM Mono', monospace;
+          font-size: 0.73rem;
+          padding: 0;
         }
+        .sn-link:hover { opacity: 0.75; }
+        .sn-view-all {
+          font-family: 'DM Mono', monospace;
+          font-size: 0.7rem;
+          color: rgba(200,168,130,0.5);
+          text-align: center;
+          display: block;
+          padding-top: 0.3rem;
+          background: none;
+          border: none;
+          width: 100%;
+          cursor: none;
+          letter-spacing: 0.06em;
+        }
+        .sn-view-all:hover { color: rgba(200,168,130,0.8); }
         .sn-loading {
           display: flex;
           align-items: center;
@@ -186,13 +208,18 @@ export default function SavedNotes() {
         </div>
       ) : notes.length === 0 ? (
         <div className="sn-empty">
-          <span className="sn-empty-icon">📓</span>
-          <p>No notes yet.<br /><a href="/notes">Generate your first AI notes →</a></p>
+          <span className="sn-empty-icon">&#128218;</span>
+          <p>
+            No notes yet.<br />
+            <button className="sn-link" onClick={() => navigate("/notes")}>
+              Generate your first AI notes
+            </button>
+          </p>
         </div>
       ) : (
         <div className="sn-list">
           {notes.slice(0, 5).map((note) => (
-            <div key={note.id} className="sn-item">
+            <div key={note.id} className="sn-item" onClick={() => navigate("/notes")}>
               <div className="sn-item-top">
                 <span className="sn-item-title">{note.title || note.subject}</span>
                 <span className="sn-item-date">{formatDate(note.created_at)}</span>
@@ -213,21 +240,9 @@ export default function SavedNotes() {
             </div>
           ))}
           {notes.length > 5 && (
-            <a
-              href="/notes"
-              style={{
-                fontFamily: "'DM Mono', monospace",
-                fontSize: "0.7rem",
-                color: "rgba(200,168,130,0.5)",
-                textAlign: "center",
-                display: "block",
-                paddingTop: "0.3rem",
-                textDecoration: "none",
-                letterSpacing: "0.06em",
-              }}
-            >
-              View all {notes.length} notes →
-            </a>
+            <button className="sn-view-all" onClick={() => navigate("/notes")}>
+              View all {notes.length} notes
+            </button>
           )}
         </div>
       )}

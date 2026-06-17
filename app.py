@@ -337,8 +337,8 @@ def watch_history_list():
 
 # ── NOTES ROUTES ──────────────────────────────────────────────────────────────
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyCdfOm9qY6GHdisZJHOE3p-SeMg-d5nxeA")
-GEMINI_URL     = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
 
 @app.route("/api/notes/generate", methods=["POST"])
 @jwt_required()
@@ -465,7 +465,7 @@ def college_trending():
 # VIDEO ROUTES
 # ═════════════════════════════════════════════════════════════════════════════
 
-YOUTUBE_API_KEY    = os.environ.get("YOUTUBE_API_KEY", "AIzaSyBlxvbuKSuJFvZI9XCY5idZ4rks8e24y0c")
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 YOUTUBE_SEARCH_URL = "https://www.googleapis.com/youtube/v3/search"
 YOUTUBE_VIDEO_URL  = "https://www.googleapis.com/youtube/v3/videos"
 

@@ -1,14 +1,12 @@
 """
-examprep + Knowtify Backend (v6)
-Fixes in v6:
-  - CORS properly configured for all origins + preflight
-  - /api/videos now accepts 'topics' OR 'syllabus_topics', exam_days optional
-  - Added WatchHistory model + routes
-  - Added Note model + routes
-  - Added /api/notes/generate (Gemini AI)
+examprep + Knowtify Backend (v7)
+Fixes/additions in v7:
+  - Added POST /api/transcript (youtube-transcript-api, 4-level fallback)
+  - Updated /api/notes/generate to accept optional transcript + video_title fields
+  - All other routes unchanged from v6
 """
 
-import re, math, os, io, requests, json
+import re, math, os, io, requests, json, time
 from datetime import timedelta, datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -20,16 +18,19 @@ from flask_jwt_extended import (
 from werkzeug.security import generate_password_hash, check_password_hash
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+from youtube_transcript_api import (
+    YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
+)
 
 app = Flask(__name__)
 
-# ── CORS fix — allow all origins with proper preflight ─────────────────────
+# ── CORS ───────────────────────────────────────────────────────────────────────
 CORS(app, resources={r"/api/*": {"origins": "*"}},
      supports_credentials=False,
      allow_headers=["Content-Type", "Authorization"],
      methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
 
-# ── Database config ───────────────────────────────────────────────────────────
+# ── Database ───────────────────────────────────────────────────────────────────
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{os.path.join(BASE_DIR, 'knowtify.db')}"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
@@ -39,7 +40,7 @@ app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(days=30)
 db  = SQLAlchemy(app)
 jwt = JWTManager(app)
 
-# ── Models ────────────────────────────────────────────────────────────────────
+# ── Models ─────────────────────────────────────────────────────────────────────
 
 class User(db.Model):
     __tablename__ = "users"
@@ -59,10 +60,11 @@ class User(db.Model):
     target_exam   = db.Column(db.String(100), nullable=True)
     subjects      = db.Column(db.Text,        nullable=True)
 
-    streak        = db.Column(db.Integer, default=0)
-    videos_done   = db.Column(db.Integer, default=0)
-    quiz_avg      = db.Column(db.Float,   default=0.0)
-    notes_saved   = db.Column(db.Integer, default=0)
+    streak        = db.Column(db.Integer,  default=0)
+    videos_done   = db.Column(db.Integer,  default=0)
+    quiz_avg      = db.Column(db.Float,    default=0.0)
+    notes_saved   = db.Column(db.Integer,  default=0)
+    last_login    = db.Column(db.Date,     nullable=True)
 
     def to_dict(self):
         return {
@@ -156,17 +158,15 @@ class Note(db.Model):
         }
 
 
-# Create all tables on startup
 with app.app_context():
     db.create_all()
 
 
-# ── AUTH ROUTES ───────────────────────────────────────────────────────────────
+# ── AUTH ───────────────────────────────────────────────────────────────────────
 
 @app.route("/api/auth/register", methods=["POST"])
 def register():
-    data = request.get_json(force=True)
-
+    data     = request.get_json(force=True)
     name     = (data.get("name") or "").strip()
     email    = (data.get("email") or "").strip().lower()
     password = (data.get("password") or "").strip()
@@ -212,10 +212,30 @@ def login():
         return jsonify({"error": "Invalid email or password"}), 401
 
     token = create_access_token(identity=str(user.id))
+
+    # ── Streak logic: increment once per day, reset if gap > 1 day ──
+    today = datetime.utcnow().date()
+    if user.last_login is None:
+        # First ever login
+        user.streak     = 1
+        user.last_login = today
+    elif user.last_login == today:
+        # Already logged in today — no change
+        pass
+    elif (today - user.last_login).days == 1:
+        # Consecutive day — increment
+        user.streak     = (user.streak or 0) + 1
+        user.last_login = today
+    else:
+        # Gap of 2+ days — reset
+        user.streak     = 1
+        user.last_login = today
+    db.session.commit()
+
     return jsonify({"token": token, "user": user.to_dict()}), 200
 
 
-# ── PROFILE ROUTES ────────────────────────────────────────────────────────────
+# ── PROFILE ────────────────────────────────────────────────────────────────────
 
 @app.route("/api/user/profile", methods=["GET"])
 @jwt_required()
@@ -233,7 +253,7 @@ def update_profile():
     if not user:
         return jsonify({"error": "User not found"}), 404
 
-    data = request.get_json(force=True)
+    data   = request.get_json(force=True)
     fields = ["name", "college", "university", "year", "branch",
               "city", "career_goal", "target_exam"]
     for f in fields:
@@ -246,7 +266,7 @@ def update_profile():
     return jsonify(user.to_dict()), 200
 
 
-# ── QUIZ ROUTES ───────────────────────────────────────────────────────────────
+# ── QUIZ ───────────────────────────────────────────────────────────────────────
 
 @app.route("/api/quiz/submit", methods=["POST"])
 @jwt_required()
@@ -282,7 +302,48 @@ def quiz_history():
     return jsonify([a.to_dict() for a in attempts]), 200
 
 
-# ── WATCH HISTORY ROUTES ──────────────────────────────────────────────────────
+@app.route("/api/quiz/generate", methods=["POST"])
+@jwt_required()
+def generate_quiz():
+    data       = request.get_json(force=True)
+    subject    = (data.get("subject") or "").strip()
+    difficulty = (data.get("difficulty") or "Medium").strip()
+
+    if not subject:
+        return jsonify({"error": "subject is required"}), 400
+
+    prompt = f"""Generate exactly 10 multiple choice questions for Indian engineering students on the subject: "{subject}".
+Difficulty: {difficulty}.
+Focus on university exam and GATE-style questions.
+
+Return ONLY a valid JSON array, no markdown, no explanation, just the array:
+[
+  {{
+    "question": "Question text here?",
+    "options": ["A) option1", "B) option2", "C) option3", "D) option4"],
+    "correct": "A",
+    "explanation": "Brief explanation of why A is correct."
+  }}
+]"""
+
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+    resp    = call_gemini(payload)
+
+    if resp is None:
+        return jsonify({"error": "Gemini rate limit reached. Please wait a moment and try again."}), 429
+
+    try:
+        raw    = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+        clean  = re.sub(r"```json|```", "", raw).strip()
+        parsed = json.loads(clean)
+        if not isinstance(parsed, list) or len(parsed) == 0:
+            raise ValueError("Empty or invalid quiz array")
+        return jsonify({"questions": parsed[:10]}), 200
+    except Exception as e:
+        return jsonify({"error": f"Quiz parse error: {str(e)}"}), 502
+
+
+# ── WATCH HISTORY ──────────────────────────────────────────────────────────────
 
 @app.route("/api/watch-history/log", methods=["POST"])
 @jwt_required()
@@ -300,7 +361,6 @@ def log_watch():
     )
     db.session.add(entry)
 
-    # increment videos_done on user
     user = User.query.get(user_id)
     if user:
         user.videos_done = (user.videos_done or 0) + 1
@@ -335,29 +395,178 @@ def watch_history_list():
     return jsonify([e.to_dict() for e in entries]), 200
 
 
-# ── NOTES ROUTES ──────────────────────────────────────────────────────────────
+# ── GEMINI HELPERS ─────────────────────────────────────────────────────────────
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyCdfOm9qY6GHdisZJHOE3p-SeMg-d5nxeA")
-GEMINI_URL     = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODELS  = [
+    "gemini-2.0-flash",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash-lite",
+]
+
+def call_gemini(payload, retries=3, backoff=5):
+    """Call Gemini with retry on 429, cycling through models."""
+    for attempt in range(retries):
+        for model in GEMINI_MODELS:
+            url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{model}:generateContent?key={GEMINI_API_KEY}"
+            )
+            try:
+                resp = requests.post(url, json=payload, timeout=45)
+                if resp.status_code == 200:
+                    return resp
+                elif resp.status_code == 429:
+                    print(f"[Gemini] 429 on {model}, attempt {attempt+1}/{retries} — waiting {backoff}s")
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 30)
+                elif resp.status_code == 404:
+                    print(f"[Gemini] 404 on {model} — skipping")
+                    break
+                else:
+                    print(f"[Gemini] {resp.status_code} on {model}: {resp.text[:200]}")
+            except Exception as e:
+                print(f"[Gemini] Exception on {model}: {e}")
+    return None
+
+
+# ── TRANSCRIPT ─────────────────────────────────────────────────────────────────
+
+@app.route("/api/transcript", methods=["POST"])
+@jwt_required()
+def get_transcript():
+    data     = request.get_json(force=True)
+    video_id = (data.get("video_id") or "").strip()
+
+    if not video_id:
+        return jsonify({"error": "video_id is required"}), 400
+
+    try:
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        transcript_obj  = None
+        source          = "manual"
+
+        # 1. Manually-created English
+        try:
+            transcript_obj = transcript_list.find_manually_created_transcript(["en"])
+        except NoTranscriptFound:
+            pass
+
+        # 2. Any manually-created language -> translate to English
+        if transcript_obj is None:
+            try:
+                all_manual = [t for t in transcript_list if not t.is_generated]
+                if all_manual:
+                    transcript_obj = all_manual[0]
+                    if transcript_obj.language_code != "en":
+                        transcript_obj = transcript_obj.translate("en")
+                    source = "manual_translated"
+            except Exception:
+                pass
+
+        # 3. Auto-generated English
+        if transcript_obj is None:
+            try:
+                transcript_obj = transcript_list.find_generated_transcript(["en"])
+                source = "generated"
+            except NoTranscriptFound:
+                pass
+
+        # 4. Any auto-generated -> translate to English
+        if transcript_obj is None:
+            try:
+                all_generated = [t for t in transcript_list if t.is_generated]
+                if all_generated:
+                    transcript_obj = all_generated[0]
+                    if transcript_obj.language_code != "en":
+                        transcript_obj = transcript_obj.translate("en")
+                    source = "generated_translated"
+            except Exception:
+                pass
+
+        if transcript_obj is None:
+            return jsonify({
+                "success": False,
+                "error": "No transcript available for this video",
+                "fallback_available": True,
+            }), 200
+
+        entries   = transcript_obj.fetch()
+        full_text = " ".join(
+            e["text"].strip() for e in entries if (e.get("text") or "").strip()
+        )
+
+        MAX_CHARS = 12000
+        trimmed   = len(full_text) > MAX_CHARS
+        if trimmed:
+            full_text = full_text[:MAX_CHARS]
+
+        return jsonify({
+            "success":    True,
+            "transcript": full_text,
+            "source":     source,
+            "trimmed":    trimmed,
+        }), 200
+
+    except TranscriptsDisabled:
+        return jsonify({
+            "success": False,
+            "error": "Transcripts are disabled for this video",
+            "fallback_available": True,
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": f"Could not fetch transcript: {str(e)}",
+            "fallback_available": True,
+        }), 200
+
+
+# ── NOTES ──────────────────────────────────────────────────────────────────────
 
 @app.route("/api/notes/generate", methods=["POST"])
 @jwt_required()
 def generate_notes():
-    data    = request.get_json(force=True)
-    subject = data.get("subject", "").strip()
-    topics  = data.get("topics", [])
-    pyqs    = data.get("pyqs", "").strip()
-    video   = data.get("video", None)
+    data        = request.get_json(force=True)
+    subject     = data.get("subject",     "").strip()
+    topics      = data.get("topics",      [])
+    pyqs        = data.get("pyqs",        "").strip()
+    video       = data.get("video",       None)   # legacy field, kept for compat
+    transcript  = data.get("transcript",  "").strip()
+    video_title = data.get("video_title", "").strip()
 
-    if not subject:
-        return jsonify({"error": "subject is required"}), 400
+    if not subject and not transcript and not topics:
+        return jsonify({"error": "subject or transcript is required"}), 400
 
     topics_str = ", ".join(topics) if topics else "all core topics"
-    video_str  = f"\nReference video: '{video.get('title','')}' by {video.get('channel','')}" if video else ""
-    pyqs_str   = f"\nPrevious year questions to focus on:\n{pyqs}" if pyqs else ""
 
-    prompt = f"""Generate comprehensive exam-prep notes for the subject: {subject}
-Topics to cover: {topics_str}{video_str}{pyqs_str}
+    # Transcript is the primary content source when present
+    if transcript:
+        v_ref       = f'"{video_title}"' if video_title else "the video"
+        content_str = (
+            f"\nPRIMARY SOURCE — Transcript of YouTube video {v_ref}:\n"
+            f"```\n{transcript}\n```\n\n"
+            f"Generate notes that accurately capture what was taught in this video. "
+            f"Include every concept, definition, formula, and example from the transcript.\n"
+        )
+        note_subject = video_title or subject or "Video Notes"
+    else:
+        video_str = (
+            f"\nReference video: '{video.get('title','')}' by {video.get('channel','')}"
+            if video else ""
+        )
+        content_str = (
+            f"\nSubject: {subject or 'General'}\n"
+            f"Topics to cover: {topics_str}"
+            f"{video_str}\n"
+        )
+        note_subject = subject
+
+    pyqs_str = f"\nPrevious year questions to focus on:\n{pyqs}" if pyqs else ""
+
+    prompt = f"""Generate comprehensive exam-prep notes for an Indian university student.
+{content_str}{pyqs_str}
 
 Return a JSON object with this exact structure (no markdown, no backticks, raw JSON only):
 {{
@@ -376,31 +585,29 @@ Return a JSON object with this exact structure (no markdown, no backticks, raw J
 
 Include 4-6 sections covering the most important concepts. Make key_points concise and exam-focused."""
 
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+    resp    = call_gemini(payload)
+
+    if resp is None:
+        return jsonify({"error": "Gemini API rate limit reached. Please wait 1-2 minutes and try again."}), 429
+
     try:
-        resp = requests.post(
-            GEMINI_URL,
-            json={"contents": [{"parts": [{"text": prompt}]}]},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        raw = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-        # strip any accidental markdown fences
-        raw = re.sub(r"```json|```", "", raw).strip()
+        raw        = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+        raw        = re.sub(r"```json|```", "", raw).strip()
         notes_data = json.loads(raw)
-        notes_data["subject"] = subject
+        notes_data["subject"] = note_subject
         return jsonify(notes_data), 200
     except json.JSONDecodeError:
-        # return raw text wrapped in structure if JSON parse fails
         return jsonify({
-            "title"     : f"{subject} Notes",
-            "summary"   : raw[:300] if 'raw' in dir() else "Notes generated.",
-            "tags"      : [subject],
-            "sections"  : [{"heading": "Notes", "content": raw if 'raw' in dir() else "", "key_points": []}],
-            "exam_tips" : [],
-            "subject"   : subject,
+            "title":     f"{note_subject} Notes",
+            "summary":   raw[:300] if "raw" in dir() else "Notes generated.",
+            "tags":      [note_subject],
+            "sections":  [{"heading": "Notes", "content": raw if "raw" in dir() else "", "key_points": []}],
+            "exam_tips": [],
+            "subject":   note_subject,
         }), 200
     except Exception as e:
-        return jsonify({"error": f"Gemini error: {str(e)}"}), 502
+        return jsonify({"error": f"Gemini parse error: {str(e)}"}), 502
 
 
 @app.route("/api/notes", methods=["POST"])
@@ -448,7 +655,7 @@ def delete_note(note_id):
     return jsonify({"message": "Deleted"}), 200
 
 
-# ── COLLEGE TRENDING ──────────────────────────────────────────────────────────
+# ── COLLEGE TRENDING ───────────────────────────────────────────────────────────
 
 @app.route("/api/trending/college", methods=["GET"])
 @jwt_required()
@@ -461,11 +668,9 @@ def college_trending():
     return jsonify([{"college": r[0], "count": r[1]} for r in rows]), 200
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# VIDEO ROUTES
-# ═════════════════════════════════════════════════════════════════════════════
+# ── VIDEO ──────────────────────────────────────────────────────────────────────
 
-YOUTUBE_API_KEY    = os.environ.get("YOUTUBE_API_KEY", "AIzaSyBlxvbuKSuJFvZI9XCY5idZ4rks8e24y0c")
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 YOUTUBE_SEARCH_URL = "https://www.googleapis.com/youtube/v3/search"
 YOUTUBE_VIDEO_URL  = "https://www.googleapis.com/youtube/v3/videos"
 
@@ -556,7 +761,7 @@ def fetch_video_stats(video_ids):
         "id": ",".join(video_ids),
         "key": YOUTUBE_API_KEY,
     }
-    resp = requests.get(YOUTUBE_VIDEO_URL, params=params, timeout=10)
+    resp  = requests.get(YOUTUBE_VIDEO_URL, params=params, timeout=10)
     resp.raise_for_status()
     stats = {}
     for item in resp.json().get("items", []):
@@ -586,7 +791,7 @@ def score_by_syllabus(videos, syllabus_topics):
     if not videos or not syllabus_topics:
         return videos
     syllabus_doc = expand_topics(syllabus_topics)
-    vectorizer = TfidfVectorizer(stop_words="english", ngram_range=(1, 3), min_df=1, sublinear_tf=True)
+    vectorizer   = TfidfVectorizer(stop_words="english", ngram_range=(1, 3), min_df=1, sublinear_tf=True)
     titles = [syllabus_doc] + [v.get("snippet", {}).get("title", "") for v in videos]
     descs  = [syllabus_doc] + [v.get("snippet", {}).get("description", "")[:400] for v in videos]
     def similarities(corpus):
@@ -630,19 +835,16 @@ def get_videos():
     data    = request.get_json(force=True)
     subject = data.get("subject", "").strip()
 
-    # ✅ Accept both 'topics' (from frontend) and 'syllabus_topics' (old field)
     syllabus_topics = (
         data.get("syllabus_topics") or
         data.get("topics") or
         []
     )
-    # ✅ exam_days is optional — default to 3
     exam_days = int(data.get("exam_days", 3))
 
     if not subject:
         return jsonify({"error": "subject is required"}), 400
 
-    # If no topics provided, just use the subject itself
     if not syllabus_topics:
         syllabus_topics = [subject]
 
@@ -660,10 +862,10 @@ def get_videos():
         return jsonify({"videos": [], "total_found": 0}), 200
 
     video_ids = [v["id"]["videoId"] for v in raw_videos if v.get("id", {}).get("kind") == "youtube#video"]
-    stats    = fetch_video_stats(video_ids)
-    scored   = score_by_syllabus(raw_videos, syllabus_topics)
-    filtered = filter_by_time(scored, stats, exam_days)
-    ranked   = rank_videos(filtered)
+    stats     = fetch_video_stats(video_ids)
+    scored    = score_by_syllabus(raw_videos, syllabus_topics)
+    filtered  = filter_by_time(scored, stats, exam_days)
+    ranked    = rank_videos(filtered)
 
     out = []
     for v in ranked[:10]:
@@ -692,19 +894,18 @@ def get_videos():
     })
 
 
-# ── SYLLABUS PARSE ────────────────────────────────────────────────────────────
+# ── SYLLABUS PARSE ─────────────────────────────────────────────────────────────
 
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
 
 def ocr_image_bytes(file_bytes):
     image = Image.open(io.BytesIO(file_bytes))
-    w, h = image.size
+    w, h  = image.size
     if w < 1200:
         scale = 1200 / w
         image = image.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
     image = image.convert("L")
-    text = pytesseract.image_to_string(image, config="--psm 6")
-    return text
+    return pytesseract.image_to_string(image, config="--psm 6")
 
 @app.route("/api/parse_syllabus", methods=["POST"])
 def parse_syllabus():
@@ -775,21 +976,20 @@ def extract_topics_from_text(text):
     return topics[:30]
 
 
-# ── AI TUTOR ROUTE ────────────────────────────────────────────────────────────
+# ── AI TUTOR ───────────────────────────────────────────────────────────────────
 
 @app.route("/api/tutor/chat", methods=["POST"])
 @jwt_required()
 def tutor_chat():
-    user_id = int(get_jwt_identity())
-    data    = request.get_json(force=True)
-
-    messages     = data.get("messages", [])       # full conversation history
-    user_context = data.get("user_context", {})   # profile info from frontend
+    user_id       = int(get_jwt_identity())
+    data          = request.get_json(force=True)
+    messages      = data.get("messages", [])
+    user_context  = data.get("user_context", {})
+    watch_context = data.get("watch_context", "").strip()  # NEW: passed from frontend
 
     if not messages:
         return jsonify({"error": "messages are required"}), 400
 
-    # Build silent system prompt from user context
     name        = user_context.get("name", "Student")
     branch      = user_context.get("branch", "")
     target_exam = user_context.get("target_exam", "")
@@ -803,15 +1003,18 @@ def tutor_chat():
     if subjects:    context_parts.append(f"main subjects: {', '.join(subjects)}")
     context_str = f"The student ({name}) is " + ", ".join(context_parts) + "." if context_parts else ""
 
+    watch_str = f"\n\nRecently watched videos (use these to give context-aware answers):\n{watch_context}" if watch_context else ""
+
     system_prompt = f"""You are Knowtify's AI Tutor — an expert academic assistant for Indian university students.
-{context_str}
+{context_str}{watch_str}
 
 Your capabilities:
 - Answer subject/topic questions clearly and accurately
 - Explain concepts step by step with examples
 - Generate quiz questions (MCQ format with 4 options and correct answer marked)
 - Create practice problems with detailed solutions
-- Reference the student's notes or recently watched videos when asked
+- Proactively reference the student's recently watched videos when relevant — if a question relates to something they watched, say so
+- If the student's message includes a video transcript, base your explanation on that transcript content
 
 Response formatting rules:
 - Use **bold** for key terms and important points
@@ -826,42 +1029,216 @@ If asked to quiz, generate exactly 3 MCQs on the topic being discussed.
 If asked for practice problems, generate 2-3 problems with full solutions.
 If asked to explain, use the "concept → why it matters → example → exam tip" structure."""
 
-    # Convert frontend message format to Gemini format
     gemini_contents = []
     for msg in messages:
-        role    = "user" if msg["role"] == "user" else "model"
+        role = "user" if msg["role"] == "user" else "model"
         gemini_contents.append({
             "role": role,
             "parts": [{"text": msg["content"]}]
         })
 
-    # Inject system prompt as first user/model exchange
     full_contents = [
         {"role": "user",  "parts": [{"text": system_prompt}]},
         {"role": "model", "parts": [{"text": "Understood. I'm ready to help as Knowtify's AI Tutor!"}]},
         *gemini_contents,
     ]
 
-    gemini_models = [
-        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}",
-        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}",
-        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key={GEMINI_API_KEY}",
-    ]
-    last_error = ""
-    for model_url in gemini_models:
-        try:
-            resp = requests.post(model_url, json={"contents": full_contents}, timeout=30)
-            if resp.status_code == 200:
-                reply = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-                return jsonify({"reply": reply}), 200
-            else:
-                last_error = f"HTTP {resp.status_code}: {resp.text[:300]}"
-                print(f"[Tutor] {model_url} failed: {last_error}")
-        except Exception as e:
-            last_error = str(e)
-            print(f"[Tutor] Exception: {last_error}")
-    return jsonify({"error": f"Gemini error: {last_error}"}), 502
+    resp = call_gemini({"contents": full_contents})
+    if resp is None:
+        return jsonify({"error": "Gemini rate limit reached. Please wait a moment and try again."}), 429
+    try:
+        reply = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
 
+        # ── Proactive suggestion logic ─────────────────────────────────────
+        # Extract the topic from the last user message
+        last_user_msg = next(
+            (m["content"] for m in reversed(messages) if m["role"] == "user"), ""
+        )
+
+        # Don't suggest if user was asking for quiz/practice (already an action)
+        skip_keywords = ["quiz me", "quiz", "practice problem", "mcq", "test me",
+                         "generate notes", "find video", "explain last video"]
+        should_suggest = not any(kw in last_user_msg.lower() for kw in skip_keywords)
+
+        suggestion = None
+        if should_suggest and len(reply) > 100:
+            # Check if topic matches any watched video subject
+            watched_subjects = []
+            if watch_context:
+                for line in watch_context.split("\n"):
+                    if "subject:" in line.lower():
+                        subj = line.lower().split("subject:")[-1].strip().rstrip(")")
+                        if subj and subj != "general":
+                            watched_subjects.append(subj)
+
+            # Extract topic keyword from last user message (first 6 words)
+            topic_words = [w for w in last_user_msg.split()[:6]
+                           if len(w) > 3 and w.lower() not in
+                           {"what","tell","explain","about","please","how","why","does","give","can","the","this","that","is","are","was","were"}]
+            topic = " ".join(topic_words[:3]) if topic_words else ""
+
+            # Decide which suggestion to show
+            msg_lower = last_user_msg.lower()
+            reply_lower = reply.lower()
+
+            # If reply contains a substantial explanation → offer notes
+            explanation_signals = ["is a", "are ", "refers to", "means ", "concept",
+                                   "algorithm", "works by", "defined as", "formula",
+                                   "example:", "step 1", "1."]
+            has_explanation = any(sig in reply_lower for sig in explanation_signals)
+
+            if has_explanation and topic:
+                # Check if we have a watched video on this topic
+                topic_in_watched = any(topic.lower() in ws for ws in watched_subjects)
+                if topic_in_watched:
+                    matching = next((ws for ws in watched_subjects if topic.lower() in ws), "")
+                    suggestion = {
+                        "type":   "video_context",
+                        "label":  f"Explain from your {matching} video",
+                        "action": "explain_last_video",
+                        "topic":  topic,
+                    }
+                else:
+                    suggestion = {
+                        "type":   "notes",
+                        "label":  f"Generate notes on {topic}",
+                        "action": "generate_notes",
+                        "topic":  topic,
+                    }
+            elif topic and not has_explanation:
+                suggestion = {
+                    "type":   "video",
+                    "label":  f"Find videos on {topic}",
+                    "action": "find_videos",
+                    "topic":  topic,
+                }
+
+        return jsonify({"reply": reply, "suggestion": suggestion}), 200
+    except Exception as e:
+        return jsonify({"error": f"Tutor parse error: {str(e)}"}), 502
+
+
+# ── RECOMMENDATIONS ────────────────────────────────────────────────────────────
+
+BRANCH_SUBJECTS = {
+    "computer science": ["Data Structures & Algorithms", "Operating Systems", "DBMS", "Computer Networks", "OOP"],
+    "cse":              ["Data Structures & Algorithms", "Operating Systems", "DBMS", "Computer Networks", "OOP"],
+    "information technology": ["Web Development", "DBMS", "Computer Networks", "Software Engineering", "Python"],
+    "electronics":      ["Digital Electronics", "Signals & Systems", "Microprocessors", "VLSI", "Communication Systems"],
+    "ece":              ["Digital Electronics", "Signals & Systems", "Microprocessors", "VLSI", "Communication Systems"],
+    "electrical":       ["Power Systems", "Control Systems", "Electrical Machines", "Circuit Theory", "Power Electronics"],
+    "mechanical":       ["Thermodynamics", "Fluid Mechanics", "Manufacturing", "Machine Design", "Engineering Mechanics"],
+    "civil":            ["Structural Analysis", "Concrete Structures", "Geotechnical Engineering", "Fluid Mechanics", "Surveying"],
+}
+
+@app.route("/api/recommendations", methods=["GET"])
+@jwt_required()
+def get_recommendations():
+    user_id = int(get_jwt_identity())
+    user    = User.query.get(user_id)
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+
+    watch_entries = WatchHistory.query.filter_by(user_id=user_id)\
+                      .order_by(WatchHistory.watched_at.desc()).all()
+    quiz_entries  = QuizAttempt.query.filter_by(user_id=user_id)\
+                      .order_by(QuizAttempt.created_at.desc()).all()
+
+    watch_counts = {}
+    for w in watch_entries:
+        subj = (w.subject or "").strip().lower()
+        if subj:
+            watch_counts[subj] = watch_counts.get(subj, 0) + 1
+
+    quiz_scores = {}
+    quiz_counts = {}
+    for q in quiz_entries:
+        subj = (q.subject or "").strip().lower()
+        if subj:
+            quiz_scores[subj] = quiz_scores.get(subj, 0) + q.score
+            quiz_counts[subj] = quiz_counts.get(subj, 0) + 1
+    quiz_avg = {s: round(quiz_scores[s] / quiz_counts[s]) for s in quiz_scores}
+
+    recommendations = []
+
+    # Rule 1: Watched but quiz score < 60 → needs revision
+    for subj, count in watch_counts.items():
+        avg = quiz_avg.get(subj)
+        if avg is not None and avg < 60:
+            recommendations.append({
+                "type": "weak", "subject": subj.title(),
+                "reason": f"Quiz avg {avg}% — needs revision",
+                "action": "quiz", "icon": "◈", "priority": 1,
+            })
+
+    # Rule 2: Quizzed well but haven't watched much → go deeper
+    for subj, avg in quiz_avg.items():
+        if avg >= 75 and watch_counts.get(subj, 0) < 2:
+            recommendations.append({
+                "type": "deepen", "subject": subj.title(),
+                "reason": f"Quiz avg {avg}% — ready for advanced content",
+                "action": "video", "icon": "▶", "priority": 2,
+            })
+
+    # Rule 3: Branch subjects not yet explored
+    branch_key     = (user.branch or "").lower()
+    matched_branch = next((k for k in BRANCH_SUBJECTS if k in branch_key), None)
+    if matched_branch:
+        watched_lower = set(watch_counts.keys())
+        for bs in BRANCH_SUBJECTS[matched_branch]:
+            if bs.lower() not in watched_lower:
+                recommendations.append({
+                    "type": "explore", "subject": bs,
+                    "reason": f"Core topic for {user.branch} — not yet explored",
+                    "action": "video", "icon": "→", "priority": 3,
+                })
+
+    # Rule 4: Career goal specific suggestions
+    goal = (user.career_goal or "").lower()
+    goal_subjects = []
+    if "gate" in goal:
+        goal_subjects = ["Engineering Mathematics", "General Aptitude", "Data Structures & Algorithms"]
+    elif "data science" in goal or "ai" in goal or "ml" in goal:
+        goal_subjects = ["Machine Learning", "Python Programming", "Linear Algebra", "Statistics"]
+    elif "software" in goal or "sde" in goal:
+        goal_subjects = ["System Design", "Data Structures & Algorithms", "Operating Systems"]
+    elif "placement" in goal:
+        goal_subjects = ["Data Structures & Algorithms", "Aptitude", "OOP Concepts"]
+
+    for gs in goal_subjects:
+        if gs.lower() not in watch_counts:
+            recommendations.append({
+                "type": "goal", "subject": gs,
+                "reason": f"Recommended for {user.career_goal}",
+                "action": "video", "icon": "✦", "priority": 2,
+            })
+
+    # Rule 5: Fallback if no history
+    if not recommendations:
+        fallback = BRANCH_SUBJECTS.get(matched_branch, [])[:3] if matched_branch \
+                   else ["Data Structures & Algorithms", "Python Programming", "Computer Networks"]
+        for fs in fallback:
+            recommendations.append({
+                "type": "start", "subject": fs,
+                "reason": "Popular starting point for your branch",
+                "action": "video", "icon": "→", "priority": 3,
+            })
+
+    # Sort by priority, deduplicate, cap at 5
+    seen_subjects = set()
+    unique = []
+    for r in sorted(recommendations, key=lambda x: x["priority"]):
+        key = r["subject"].lower()
+        if key not in seen_subjects:
+            seen_subjects.add(key)
+            unique.append(r)
+        if len(unique) >= 5:
+            break
+
+    return jsonify({"recommendations": unique}), 200
+
+
+# ── DEBUG / HEALTH ─────────────────────────────────────────────────────────────
 
 @app.route("/api/test-gemini", methods=["GET"])
 def test_gemini():
@@ -873,7 +1250,7 @@ def test_gemini():
     for url in models:
         model_name = url.split("/models/")[1].split(":")[0]
         try:
-            r = requests.post(url, json={"contents":[{"role":"user","parts":[{"text":"Say hi"}]}]}, timeout=10)
+            r = requests.post(url, json={"contents": [{"role": "user", "parts": [{"text": "Say hi"}]}]}, timeout=10)
             results[model_name] = {"status": r.status_code, "ok": r.status_code == 200, "body": r.text[:200]}
         except Exception as e:
             results[model_name] = {"status": "error", "ok": False, "body": str(e)}
@@ -887,6 +1264,8 @@ def health():
         "message"            : "knowtify + examprep backend v7 running",
         "tesseract_available": TESSERACT_AVAILABLE,
     })
+
+
 
 if __name__ == "__main__":
     app.run(debug=True, port=5000)

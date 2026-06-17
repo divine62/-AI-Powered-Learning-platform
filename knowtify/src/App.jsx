@@ -8,6 +8,7 @@ import LoginPage from "./pages/LoginPage";
 import RegisterPage from "./pages/RegisterPage";
 import ProfilePage from "./pages/ProfilePage";
 import QuizPage from "./pages/QuizPage";
+import NotesPage from "./pages/NotesPage";
 import "./styles/globals.css";
 
 function Protected({ children }) {
@@ -19,7 +20,7 @@ function Protected({ children }) {
       fontFamily: "DM Mono, monospace", fontSize: "11px",
       color: "var(--nude)", letterSpacing: "0.1em",
     }}>
-      Loading…
+      Loading...
     </div>
   );
   return user ? children : <Navigate to="/login" replace />;
@@ -37,6 +38,7 @@ function AppRoutes() {
         <Route path="/search"    element={<Protected><VideoFinderPage /></Protected>} />
         <Route path="/profile"   element={<Protected><ProfilePage /></Protected>} />
         <Route path="/quiz"      element={<Protected><QuizPage /></Protected>} />
+        <Route path="/notes"     element={<Protected><NotesPage /></Protected>} />
         <Route path="*"          element={<Navigate to="/" replace />} />
       </Routes>
     </>
