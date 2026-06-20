@@ -9,6 +9,7 @@ import RegisterPage from "./pages/RegisterPage";
 import ProfilePage from "./pages/ProfilePage";
 import QuizPage from "./pages/QuizPage";
 import NotesPage from "./pages/NotesPage";
+import ChatPage from "./pages/ChatPage";
 import "./styles/globals.css";
 
 function Protected({ children }) {
@@ -39,6 +40,7 @@ function AppRoutes() {
         <Route path="/profile"   element={<Protected><ProfilePage /></Protected>} />
         <Route path="/quiz"      element={<Protected><QuizPage /></Protected>} />
         <Route path="/notes"     element={<Protected><NotesPage /></Protected>} />
+        <Route path="/chat"      element={<Protected><ChatPage /></Protected>} />
         <Route path="*"          element={<Navigate to="/" replace />} />
       </Routes>
     </>

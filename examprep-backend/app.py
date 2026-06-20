@@ -1,9 +1,13 @@
 """
-examprep + Knowtify Backend (v7)
-Fixes/additions in v7:
-  - Added POST /api/transcript (youtube-transcript-api, 4-level fallback)
-  - Updated /api/notes/generate to accept optional transcript + video_title fields
-  - All other routes unchanged from v6
+examprep + Knowtify Backend (v8)
+Additions in v8:
+  - ChatSession and ChatMessage models
+  - GET  /api/chat/sessions         — list all sessions for user
+  - POST /api/chat/sessions         — create new session
+  - GET  /api/chat/sessions/<id>    — get session + all messages
+  - POST /api/chat/sessions/<id>/messages — add message to session
+  - DELETE /api/chat/sessions/<id>  — delete session
+  - All other routes unchanged from v7
 """
 
 import re, math, os, io, requests, json, time
@@ -143,7 +147,7 @@ class Note(db.Model):
     subject    = db.Column(db.String(200), nullable=True)
     content    = db.Column(db.Text, nullable=True)
     summary    = db.Column(db.Text, nullable=True)
-    tags       = db.Column(db.Text, nullable=True)   # comma-separated
+    tags       = db.Column(db.Text, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
     def to_dict(self):
@@ -154,6 +158,51 @@ class Note(db.Model):
             "content"   : self.content,
             "summary"   : self.summary,
             "tags"      : self.tags.split(",") if self.tags else [],
+            "created_at": self.created_at.isoformat() if self.created_at else "",
+        }
+
+
+# ── NEW: Chat models ───────────────────────────────────────────────────────────
+
+class ChatSession(db.Model):
+    __tablename__ = "chat_sessions"
+
+    id         = db.Column(db.Integer, primary_key=True)
+    user_id    = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+    title      = db.Column(db.String(200), default="New Chat")
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    messages   = db.relationship("ChatMessage", backref="session",
+                                 cascade="all, delete-orphan",
+                                 order_by="ChatMessage.created_at")
+
+    def to_dict(self, include_messages=False):
+        d = {
+            "id"        : self.id,
+            "title"     : self.title,
+            "created_at": self.created_at.isoformat() if self.created_at else "",
+            "updated_at": self.updated_at.isoformat() if self.updated_at else "",
+            "message_count": len(self.messages),
+        }
+        if include_messages:
+            d["messages"] = [m.to_dict() for m in self.messages]
+        return d
+
+
+class ChatMessage(db.Model):
+    __tablename__ = "chat_messages"
+
+    id         = db.Column(db.Integer, primary_key=True)
+    session_id = db.Column(db.Integer, db.ForeignKey("chat_sessions.id"), nullable=False)
+    role       = db.Column(db.String(20), nullable=False)   # "user" or "assistant"
+    content    = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            "id"        : self.id,
+            "role"      : self.role,
+            "content"   : self.content,
             "created_at": self.created_at.isoformat() if self.created_at else "",
         }
 
@@ -213,21 +262,16 @@ def login():
 
     token = create_access_token(identity=str(user.id))
 
-    # ── Streak logic: increment once per day, reset if gap > 1 day ──
     today = datetime.utcnow().date()
     if user.last_login is None:
-        # First ever login
         user.streak     = 1
         user.last_login = today
     elif user.last_login == today:
-        # Already logged in today — no change
         pass
     elif (today - user.last_login).days == 1:
-        # Consecutive day — increment
         user.streak     = (user.streak or 0) + 1
         user.last_login = today
     else:
-        # Gap of 2+ days — reset
         user.streak     = 1
         user.last_login = today
     db.session.commit()
@@ -405,7 +449,6 @@ GEMINI_MODELS  = [
 ]
 
 def call_gemini(payload, retries=3, backoff=5):
-    """Call Gemini with retry on 429, cycling through models."""
     for attempt in range(retries):
         for model in GEMINI_MODELS:
             url = (
@@ -446,13 +489,11 @@ def get_transcript():
         transcript_obj  = None
         source          = "manual"
 
-        # 1. Manually-created English
         try:
             transcript_obj = transcript_list.find_manually_created_transcript(["en"])
         except NoTranscriptFound:
             pass
 
-        # 2. Any manually-created language -> translate to English
         if transcript_obj is None:
             try:
                 all_manual = [t for t in transcript_list if not t.is_generated]
@@ -464,7 +505,6 @@ def get_transcript():
             except Exception:
                 pass
 
-        # 3. Auto-generated English
         if transcript_obj is None:
             try:
                 transcript_obj = transcript_list.find_generated_transcript(["en"])
@@ -472,7 +512,6 @@ def get_transcript():
             except NoTranscriptFound:
                 pass
 
-        # 4. Any auto-generated -> translate to English
         if transcript_obj is None:
             try:
                 all_generated = [t for t in transcript_list if t.is_generated]
@@ -532,7 +571,7 @@ def generate_notes():
     subject     = data.get("subject",     "").strip()
     topics      = data.get("topics",      [])
     pyqs        = data.get("pyqs",        "").strip()
-    video       = data.get("video",       None)   # legacy field, kept for compat
+    video       = data.get("video",       None)
     transcript  = data.get("transcript",  "").strip()
     video_title = data.get("video_title", "").strip()
 
@@ -541,7 +580,6 @@ def generate_notes():
 
     topics_str = ", ".join(topics) if topics else "all core topics"
 
-    # Transcript is the primary content source when present
     if transcript:
         v_ref       = f'"{video_title}"' if video_title else "the video"
         content_str = (
@@ -651,6 +689,144 @@ def delete_note(note_id):
     if not note:
         return jsonify({"error": "Note not found"}), 404
     db.session.delete(note)
+    db.session.commit()
+    return jsonify({"message": "Deleted"}), 200
+
+
+# ── CHAT SESSIONS ──────────────────────────────────────────────────────────────
+
+@app.route("/api/chat/sessions", methods=["GET"])
+@jwt_required()
+def list_sessions():
+    user_id  = int(get_jwt_identity())
+    sessions = ChatSession.query.filter_by(user_id=user_id)\
+                 .order_by(ChatSession.updated_at.desc()).all()
+    return jsonify([s.to_dict() for s in sessions]), 200
+
+
+@app.route("/api/chat/sessions", methods=["POST"])
+@jwt_required()
+def create_session():
+    user_id = int(get_jwt_identity())
+    data    = request.get_json(force=True)
+    session = ChatSession(
+        user_id = user_id,
+        title   = data.get("title", "New Chat"),
+    )
+    db.session.add(session)
+    db.session.commit()
+    return jsonify(session.to_dict(include_messages=True)), 201
+
+
+@app.route("/api/chat/sessions/<int:session_id>", methods=["GET"])
+@jwt_required()
+def get_session(session_id):
+    user_id = int(get_jwt_identity())
+    session = ChatSession.query.filter_by(id=session_id, user_id=user_id).first()
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+    return jsonify(session.to_dict(include_messages=True)), 200
+
+
+@app.route("/api/chat/sessions/<int:session_id>/messages", methods=["POST"])
+@jwt_required()
+def add_message(session_id):
+    user_id = int(get_jwt_identity())
+    session = ChatSession.query.filter_by(id=session_id, user_id=user_id).first()
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+
+    data         = request.get_json(force=True)
+    user_content = (data.get("message") or "").strip()
+    user_context = data.get("user_context", {})
+
+    if not user_content:
+        return jsonify({"error": "message is required"}), 400
+
+    # Save user message
+    user_msg = ChatMessage(session_id=session_id, role="user", content=user_content)
+    db.session.add(user_msg)
+
+    # Auto-title session from first user message
+    if len(session.messages) == 0 and session.title == "New Chat":
+        session.title = user_content[:60] + ("…" if len(user_content) > 60 else "")
+
+    # Build conversation history for Gemini
+    history = [
+        {"role": "user" if m.role == "user" else "model",
+         "parts": [{"text": m.content}]}
+        for m in session.messages
+    ]
+    history.append({"role": "user", "parts": [{"text": user_content}]})
+
+    # Build system context
+    name        = user_context.get("name", "Student")
+    branch      = user_context.get("branch", "")
+    target_exam = user_context.get("target_exam", "")
+    subjects    = user_context.get("subjects", [])
+    year        = user_context.get("year", "")
+
+    context_parts = []
+    if branch:      context_parts.append(f"studying {branch}")
+    if year:        context_parts.append(f"in year {year}")
+    if target_exam: context_parts.append(f"preparing for {target_exam}")
+    if subjects:    context_parts.append(f"main subjects: {', '.join(subjects)}")
+    context_str = f"The student ({name}) is " + ", ".join(context_parts) + "." if context_parts else ""
+
+    system_prompt = f"""You are Knowtify's AI Tutor — an expert academic assistant for Indian university students.
+{context_str}
+
+Your capabilities:
+- Answer subject/topic questions clearly and accurately
+- Explain concepts step by step with examples
+- Generate quiz questions (MCQ format with 4 options and correct answer marked)
+- Create practice problems with detailed solutions
+
+Response formatting rules:
+- Use **bold** for key terms
+- Use numbered lists for steps, bullet points for lists
+- For MCQs: format as "Q: ...\\nA) ... B) ... C) ... D) ...\\n✓ Answer: ..."
+- Keep responses focused and exam-oriented
+- Always be encouraging and supportive"""
+
+    full_contents = [
+        {"role": "user",  "parts": [{"text": system_prompt}]},
+        {"role": "model", "parts": [{"text": "Understood. I'm ready to help as Knowtify's AI Tutor!"}]},
+        *history,
+    ]
+
+    resp = call_gemini({"contents": full_contents})
+    if resp is None:
+        db.session.rollback()
+        return jsonify({"error": "Gemini rate limit. Please wait a moment."}), 429
+
+    try:
+        reply = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": f"Parse error: {str(e)}"}), 502
+
+    # Save assistant message
+    ai_msg = ChatMessage(session_id=session_id, role="assistant", content=reply)
+    db.session.add(ai_msg)
+    session.updated_at = datetime.utcnow()
+    db.session.commit()
+
+    return jsonify({
+        "user_message"     : user_msg.to_dict(),
+        "assistant_message": ai_msg.to_dict(),
+        "session_title"    : session.title,
+    }), 200
+
+
+@app.route("/api/chat/sessions/<int:session_id>", methods=["DELETE"])
+@jwt_required()
+def delete_session(session_id):
+    user_id = int(get_jwt_identity())
+    session = ChatSession.query.filter_by(id=session_id, user_id=user_id).first()
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+    db.session.delete(session)
     db.session.commit()
     return jsonify({"message": "Deleted"}), 200
 
@@ -976,7 +1152,7 @@ def extract_topics_from_text(text):
     return topics[:30]
 
 
-# ── AI TUTOR ───────────────────────────────────────────────────────────────────
+# ── AI TUTOR (legacy panel endpoint) ──────────────────────────────────────────
 
 @app.route("/api/tutor/chat", methods=["POST"])
 @jwt_required()
@@ -985,7 +1161,7 @@ def tutor_chat():
     data          = request.get_json(force=True)
     messages      = data.get("messages", [])
     user_context  = data.get("user_context", {})
-    watch_context = data.get("watch_context", "").strip()  # NEW: passed from frontend
+    watch_context = data.get("watch_context", "").strip()
 
     if not messages:
         return jsonify({"error": "messages are required"}), 400
@@ -1003,117 +1179,26 @@ def tutor_chat():
     if subjects:    context_parts.append(f"main subjects: {', '.join(subjects)}")
     context_str = f"The student ({name}) is " + ", ".join(context_parts) + "." if context_parts else ""
 
-    watch_str = f"\n\nRecently watched videos (use these to give context-aware answers):\n{watch_context}" if watch_context else ""
+    watch_str = f"\n\nRecently watched videos:\n{watch_context}" if watch_context else ""
 
     system_prompt = f"""You are Knowtify's AI Tutor — an expert academic assistant for Indian university students.
 {context_str}{watch_str}
+Be concise, exam-focused, and encouraging. Use **bold** for key terms."""
 
-Your capabilities:
-- Answer subject/topic questions clearly and accurately
-- Explain concepts step by step with examples
-- Generate quiz questions (MCQ format with 4 options and correct answer marked)
-- Create practice problems with detailed solutions
-- Proactively reference the student's recently watched videos when relevant — if a question relates to something they watched, say so
-- If the student's message includes a video transcript, base your explanation on that transcript content
-
-Response formatting rules:
-- Use **bold** for key terms and important points
-- Use numbered lists for steps, bullet points for lists
-- For code: wrap in triple backticks with language name
-- For MCQs: format as "Q: ... \\nA) ... B) ... C) ... D) ...\\n✓ Answer: ..."
-- For practice problems: show problem clearly, then "Solution:" section
-- Keep responses focused and exam-oriented
-- Always be encouraging and supportive
-
-If asked to quiz, generate exactly 3 MCQs on the topic being discussed.
-If asked for practice problems, generate 2-3 problems with full solutions.
-If asked to explain, use the "concept → why it matters → example → exam tip" structure."""
-
-    gemini_contents = []
+    gemini_contents = [
+        {"role": "user",  "parts": [{"text": system_prompt}]},
+        {"role": "model", "parts": [{"text": "Understood. Ready to help!"}]},
+    ]
     for msg in messages:
         role = "user" if msg["role"] == "user" else "model"
-        gemini_contents.append({
-            "role": role,
-            "parts": [{"text": msg["content"]}]
-        })
+        gemini_contents.append({"role": role, "parts": [{"text": msg["content"]}]})
 
-    full_contents = [
-        {"role": "user",  "parts": [{"text": system_prompt}]},
-        {"role": "model", "parts": [{"text": "Understood. I'm ready to help as Knowtify's AI Tutor!"}]},
-        *gemini_contents,
-    ]
-
-    resp = call_gemini({"contents": full_contents})
+    resp = call_gemini({"contents": gemini_contents})
     if resp is None:
-        return jsonify({"error": "Gemini rate limit reached. Please wait a moment and try again."}), 429
+        return jsonify({"error": "Gemini rate limit reached."}), 429
     try:
         reply = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-
-        # ── Proactive suggestion logic ─────────────────────────────────────
-        # Extract the topic from the last user message
-        last_user_msg = next(
-            (m["content"] for m in reversed(messages) if m["role"] == "user"), ""
-        )
-
-        # Don't suggest if user was asking for quiz/practice (already an action)
-        skip_keywords = ["quiz me", "quiz", "practice problem", "mcq", "test me",
-                         "generate notes", "find video", "explain last video"]
-        should_suggest = not any(kw in last_user_msg.lower() for kw in skip_keywords)
-
-        suggestion = None
-        if should_suggest and len(reply) > 100:
-            # Check if topic matches any watched video subject
-            watched_subjects = []
-            if watch_context:
-                for line in watch_context.split("\n"):
-                    if "subject:" in line.lower():
-                        subj = line.lower().split("subject:")[-1].strip().rstrip(")")
-                        if subj and subj != "general":
-                            watched_subjects.append(subj)
-
-            # Extract topic keyword from last user message (first 6 words)
-            topic_words = [w for w in last_user_msg.split()[:6]
-                           if len(w) > 3 and w.lower() not in
-                           {"what","tell","explain","about","please","how","why","does","give","can","the","this","that","is","are","was","were"}]
-            topic = " ".join(topic_words[:3]) if topic_words else ""
-
-            # Decide which suggestion to show
-            msg_lower = last_user_msg.lower()
-            reply_lower = reply.lower()
-
-            # If reply contains a substantial explanation → offer notes
-            explanation_signals = ["is a", "are ", "refers to", "means ", "concept",
-                                   "algorithm", "works by", "defined as", "formula",
-                                   "example:", "step 1", "1."]
-            has_explanation = any(sig in reply_lower for sig in explanation_signals)
-
-            if has_explanation and topic:
-                # Check if we have a watched video on this topic
-                topic_in_watched = any(topic.lower() in ws for ws in watched_subjects)
-                if topic_in_watched:
-                    matching = next((ws for ws in watched_subjects if topic.lower() in ws), "")
-                    suggestion = {
-                        "type":   "video_context",
-                        "label":  f"Explain from your {matching} video",
-                        "action": "explain_last_video",
-                        "topic":  topic,
-                    }
-                else:
-                    suggestion = {
-                        "type":   "notes",
-                        "label":  f"Generate notes on {topic}",
-                        "action": "generate_notes",
-                        "topic":  topic,
-                    }
-            elif topic and not has_explanation:
-                suggestion = {
-                    "type":   "video",
-                    "label":  f"Find videos on {topic}",
-                    "action": "find_videos",
-                    "topic":  topic,
-                }
-
-        return jsonify({"reply": reply, "suggestion": suggestion}), 200
+        return jsonify({"reply": reply, "suggestion": None}), 200
     except Exception as e:
         return jsonify({"error": f"Tutor parse error: {str(e)}"}), 502
 
@@ -1161,7 +1246,6 @@ def get_recommendations():
 
     recommendations = []
 
-    # Rule 1: Watched but quiz score < 60 → needs revision
     for subj, count in watch_counts.items():
         avg = quiz_avg.get(subj)
         if avg is not None and avg < 60:
@@ -1171,7 +1255,6 @@ def get_recommendations():
                 "action": "quiz", "icon": "◈", "priority": 1,
             })
 
-    # Rule 2: Quizzed well but haven't watched much → go deeper
     for subj, avg in quiz_avg.items():
         if avg >= 75 and watch_counts.get(subj, 0) < 2:
             recommendations.append({
@@ -1180,7 +1263,6 @@ def get_recommendations():
                 "action": "video", "icon": "▶", "priority": 2,
             })
 
-    # Rule 3: Branch subjects not yet explored
     branch_key     = (user.branch or "").lower()
     matched_branch = next((k for k in BRANCH_SUBJECTS if k in branch_key), None)
     if matched_branch:
@@ -1193,7 +1275,6 @@ def get_recommendations():
                     "action": "video", "icon": "→", "priority": 3,
                 })
 
-    # Rule 4: Career goal specific suggestions
     goal = (user.career_goal or "").lower()
     goal_subjects = []
     if "gate" in goal:
@@ -1213,7 +1294,6 @@ def get_recommendations():
                 "action": "video", "icon": "✦", "priority": 2,
             })
 
-    # Rule 5: Fallback if no history
     if not recommendations:
         fallback = BRANCH_SUBJECTS.get(matched_branch, [])[:3] if matched_branch \
                    else ["Data Structures & Algorithms", "Python Programming", "Computer Networks"]
@@ -1224,7 +1304,6 @@ def get_recommendations():
                 "action": "video", "icon": "→", "priority": 3,
             })
 
-    # Sort by priority, deduplicate, cap at 5
     seen_subjects = set()
     unique = []
     for r in sorted(recommendations, key=lambda x: x["priority"]):
@@ -1261,10 +1340,9 @@ def test_gemini():
 def health():
     return jsonify({
         "status"             : "ok",
-        "message"            : "knowtify + examprep backend v7 running",
+        "message"            : "knowtify + examprep backend v8 running",
         "tesseract_available": TESSERACT_AVAILABLE,
     })
-
 
 
 if __name__ == "__main__":

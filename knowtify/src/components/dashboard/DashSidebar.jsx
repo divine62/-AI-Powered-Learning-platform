@@ -12,8 +12,9 @@ const navItems = [
     section: "Learn",
     items: [
       { id: "search", icon: "▶", label: "Video Finder", route: "/search" },
-      { id: "quiz", icon: "◈", label: "Quiz", route: "/quiz" },
-      { id: "notes", icon: "≡", label: "AI Notes", route: "/notes" },
+      { id: "quiz",   icon: "◈", label: "Quiz",         route: "/quiz" },
+      { id: "notes",  icon: "≡", label: "AI Notes",     route: "/notes" },
+      { id: "chat",   icon: "◎", label: "AI Tutor",     route: "/chat" },
     ],
   },
   {
@@ -41,7 +42,8 @@ export default function DashSidebar() {
           border-right: 1px solid var(--card-border, rgba(200,168,130,0.1));
           display: flex;
           flex-direction: column;
-          padding: 1.8rem 0 1.5rem;
+          /* Push content below the fixed navbar (≈64px) */
+          padding: 80px 0 1.5rem;
           flex-shrink: 0;
         }
         .sidebar-logo {
@@ -151,6 +153,7 @@ export default function DashSidebar() {
         .sidebar-logout:hover { color: rgba(200,168,130,0.65); }
       `}</style>
 
+      {/* Logo — now sits below navbar due to padding-top: 80px above */}
       <div className="sidebar-logo">
         Knowtify
         <span>AI Learning Platform</span>

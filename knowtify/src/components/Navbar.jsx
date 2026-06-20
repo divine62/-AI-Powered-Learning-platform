@@ -2,12 +2,25 @@ import { NavLink, useLocation } from "react-router-dom";
 
 export default function Navbar() {
   const { pathname } = useLocation();
-  const isDashboard = pathname === "/dashboard";
+
+  const appRoutes = ["/dashboard", "/chat", "/quiz", "/notes", "/profile"];
+  const isDashboard = appRoutes.includes(pathname);
   const isSearch = pathname === "/search";
 
-  const activeLinks = isDashboard
-    ? ["My Videos", "AI Notes", "Quizzes", "Progress"]
-    : ["Features", "How it Works", "Pricing"];
+  const dashboardLinks = [
+    { label: "My Videos",  to: "/dashboard" },
+    { label: "AI Notes",   to: "/notes" },
+    { label: "Quizzes",    to: "/quiz" },
+    { label: "Progress",   to: "/dashboard" },
+  ];
+
+  const landingLinks = [
+    { label: "Features",      to: "#features" },
+    { label: "How it Works",  to: "#how-it-works" },
+    { label: "Pricing",       to: "#pricing" },
+  ];
+
+  const activeLinks = isDashboard ? dashboardLinks : landingLinks;
 
   return (
     <nav
@@ -25,16 +38,16 @@ export default function Navbar() {
       {!isSearch && (
         <ul className="flex gap-9 list-none">
           {activeLinks.map((link) => (
-            <li key={link}>
-              <a
-                href="#"
+            <li key={link.label}>
+              <NavLink
+                to={link.to}
                 className="font-mono text-xs tracking-widest uppercase transition-colors duration-300 no-underline"
                 style={{ color: "rgba(244,239,233,0.45)", textDecoration: "none" }}
                 onMouseEnter={(e) => (e.currentTarget.style.color = "var(--nude)")}
                 onMouseLeave={(e) => (e.currentTarget.style.color = "rgba(244,239,233,0.45)")}
               >
-                {link}
-              </a>
+                {link.label}
+              </NavLink>
             </li>
           ))}
         </ul>
@@ -75,7 +88,7 @@ export default function Navbar() {
           </NavLink>
         </div>
       ) : isDashboard ? (
-        /* ── /dashboard navbar ── */
+        /* ── app pages navbar ── */
         <div className="flex items-center gap-4">
           <NavLink
             to="/search"

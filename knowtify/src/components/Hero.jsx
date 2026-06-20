@@ -24,12 +24,13 @@ export default function Hero() {
         }}
       />
 
-      {/* Eyebrow */}
+      {/* Eyebrow — pushed down so it clears the fixed navbar */}
       <div
         className="relative z-10 font-mono text-xs uppercase tracking-[0.22em] opacity-0"
         style={{
           color: "var(--nude)",
           animation: "fadeUp 0.7s ease 0.2s forwards",
+          marginTop: 72,   /* clears the ~64px fixed navbar */
         }}
       >
         AI-Powered Learning Platform
