@@ -2,7 +2,7 @@ import { useState, useEffect } from "react";
 import axios from "axios";
 import { useAuth } from "../../context/AuthContext";
 
-const API = "http://127.0.0.1:5000";
+const API = (process.env.REACT_APP_API_URL || "/api").replace(/\/$/, "").replace(/\/api$/, "");
 
 const LEVEL_COLORS = [
   "rgba(255,255,255,0.04)",

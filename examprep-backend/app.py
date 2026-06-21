@@ -1,3 +1,5 @@
+from dotenv import load_dotenv
+load_dotenv()
 """
 examprep + Knowtify Backend (v8)
 Additions in v8:
@@ -36,7 +38,9 @@ CORS(app, resources={r"/api/*": {"origins": "*"}},
 
 # ── Database ───────────────────────────────────────────────────────────────────
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{os.path.join(BASE_DIR, 'knowtify.db')}"
+DATA_DIR = os.environ.get('DATA_DIR', BASE_DIR)
+os.makedirs(DATA_DIR, exist_ok=True)
+app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{os.path.join(DATA_DIR, 'knowtify.db')}"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 app.config["JWT_SECRET_KEY"] = os.environ.get("JWT_SECRET", "knowtify-secret-change-in-prod")
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(days=30)
@@ -1335,6 +1339,24 @@ def test_gemini():
             results[model_name] = {"status": "error", "ok": False, "body": str(e)}
     return jsonify(results)
 
+
+
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({
+        "status": "ok",
+        "message": "Knowtify backend is running",
+        "health": "/api/health"
+    }), 200
+
+
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({
+        "status": "ok",
+        "message": "Knowtify backend is running",
+        "health": "/api/health"
+    }), 200
 
 @app.route("/api/health", methods=["GET"])
 def health():

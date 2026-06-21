@@ -4,7 +4,7 @@ import axios from "axios";
 import { useAuth } from "../context/AuthContext";
 
 // No Gemini key here — all AI calls go through Flask
-const API = "http://127.0.0.1:5000/api";
+const API = (process.env.REACT_APP_API_URL || "/api").replace(/\/$/, "");
 
 const SUBJECTS = [
   "Data Structures & Algorithms",
@@ -42,7 +42,7 @@ export default function QuizPage() {
   useEffect(() => {
     const token = localStorage.getItem("kt_token");
     if (!token) return;
-    axios.get(`http://127.0.0.1:5000/api/watch-history`, {
+    axios.get(`${API}/watch-history`, {
       headers: { Authorization: `Bearer ${token}` },
     }).then(res => {
       const list = Array.isArray(res.data) ? res.data : (res.data.history || []);

@@ -5,7 +5,7 @@ import DashSidebar from "../components/dashboard/DashSidebar";
 import Navbar from "../components/Navbar";
 import axios from "axios";
 
-const API = "http://127.0.0.1:5000/api";
+const API = (process.env.REACT_APP_API_URL || "/api").replace(/\/$/, "");
 
 const SUGGESTIONS = [
   "Explain a concept from my syllabus",

@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import axios from "axios";
 
-const API = "http://127.0.0.1:5000";
+const API = (process.env.REACT_APP_API_URL || "/api").replace(/\/$/, "").replace(/\/api$/, "");
 
 export default function SavedNotes() {
   const token = localStorage.getItem("kt_token");

@@ -2,7 +2,7 @@ import { useState, useRef, useEffect } from "react";
 import axios from "axios";
 import jsPDF from "jspdf";
 
-const API = "http://127.0.0.1:5000";
+const API = (process.env.REACT_APP_API_URL || "/api").replace(/\/$/, "").replace(/\/api$/, "");
 
 function timeAgo(dateStr) {
   if (!dateStr) return "";

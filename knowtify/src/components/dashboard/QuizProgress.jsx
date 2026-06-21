@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import axios from "axios";
 
-const API = "http://127.0.0.1:5000/api";
+const API = (process.env.REACT_APP_API_URL || "/api").replace(/\/$/, "");
 
 function ScoreRing({ pct }) {
   const r = 14;
